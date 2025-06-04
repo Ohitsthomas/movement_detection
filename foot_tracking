@@ -5,7 +5,7 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
 # Edge Impulse Keys
-#API Key einsetzten (richtige datei ist "movement_detection3.py)
+//API Key einsetzten (richtige datei ist "movement_detection3.py)
 
 RECORD_DURATION = 2.0
 

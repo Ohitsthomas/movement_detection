@@ -1,0 +1,106 @@
+import cv2, time, hmac, hashlib, json, requests
+from collections import deque
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+
+# Edge Impulse Keys
+#API Key einsetzten (richtige datei ist "movement_detection3.py)
+
+RECORD_DURATION = 2.0
+
+# Mediapipe Setup
+base_opts = python.BaseOptions(model_asset_path='pose_landmarker_heavy.task')
+options = vision.PoseLandmarkerOptions(
+    base_options=base_opts,
+    running_mode=vision.RunningMode.VIDEO
+)
+detector = vision.PoseLandmarker.create_from_options(options)
+
+# Puffer & Status
+buffer = deque()
+recording_start = None
+frame_times = deque(maxlen=30)  # Für FPS-Berechnung
+
+def send_to_edge_impulse(values, interval_ms):
+    data = {
+        "protected":{"ver":"v1","alg":"HS256","iat":int(time.time())},
+        "signature":"0"*64,
+        "payload":{
+            "device_name":"laufband_kamera","device_type":"opencv",
+            "interval_ms": interval_ms,
+            "sensors":[
+                {"name":"fuss_links_x","units":"px"},
+                {"name":"fuss_links_y","units":"px"},
+                {"name":"fuss_rechts_x","units":"px"},
+                {"name":"fuss_rechts_y","units":"px"}
+            ],
+            "values": values
+        }
+    }
+    msg = json.dumps(data)
+    sig = hmac.new(HMAC_KEY.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    data["signature"] = sig
+    res = requests.post(
+        "https://ingestion.edgeimpulse.com/api/training/data",
+        headers={
+            'Content-Type': 'application/json',
+            'x-file-name': 'walk',
+            'x-api-key': API_KEY
+        },
+        data=json.dumps(data)
+    )
+    print("Upload", res.status_code, res.text)
+
+def main():
+    global recording_start, buffer
+    cap = cv2.VideoCapture(0)
+
+    while True:
+        success, frame = cap.read()
+        if not success:
+            break
+
+        now = time.time()
+        ts = int(now * 1000)
+        frame_times.append(now)
+
+        # FPS berechnen (über gleitendes Fenster)
+        if len(frame_times) > 1:
+            duration = frame_times[-1] - frame_times[0]
+            fps = len(frame_times) / duration if duration > 0 else 30
+        else:
+            fps = 30
+        interval_ms = int(1000 / fps)
+
+        # Pose-Erkennung
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
+        result = detector.detect_for_video(mp_img, ts)
+
+        if result.pose_landmarks:
+            lm = result.pose_landmarks[0]
+            h, w, _ = frame.shape
+            l_x, l_y = int(lm[31].x * w), int(lm[31].y * h)
+            r_x, r_y = int(lm[32].x * w), int(lm[32].y * h)
+
+            if all(0 < v < max(w, h) for v in (l_x, l_y, r_x, r_y)):
+                if recording_start is None:
+                    recording_start = now
+                    buffer.clear()
+
+                if now - recording_start <= RECORD_DURATION:
+                    buffer.append([l_x, l_y, r_x, r_y])
+                else:
+                    send_to_edge_impulse(list(buffer), interval_ms)
+                    recording_start = None
+
+        # Anzeige
+        cv2.imshow("Füße", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()

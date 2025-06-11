@@ -1,0 +1,74 @@
+#include <Wire.h>
+#include <VL53L1X.h>
+#include <SPI.h>
+
+VL53L1X sensor;
+
+const byte csPin = 2;
+const byte pot0 = 0x12;
+
+const int minDistance = 300;   // zu nah = stoppen
+const int maxDistance = 1700;  // max. Reaktionsbereich
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+
+  if (!sensor.init()) {
+    Serial.println("Sensor nicht gefunden!");
+    while (1);
+  }
+
+  sensor.setDistanceMode(VL53L1X::Long);
+  sensor.setMeasurementTimingBudget(50000);
+  sensor.startContinuous(50);
+
+  pinMode(csPin, OUTPUT);
+  digitalWrite(csPin, HIGH);
+  SPI.begin();
+
+  Serial.println("Optimierte Laufbandsteuerung gestartet");
+}
+
+void loop() {
+  int distance = sensor.read();
+
+  // Glättung: einfache Mittelwertbildung (optional erweitern)
+  static int smoothDistance = 0;
+  smoothDistance = 0.8 * smoothDistance + 0.2 * distance;
+
+  int value = 0;
+
+  if (smoothDistance < minDistance) {
+    value = 0;  // Sicherheitsstopp, Person zu nah
+  } else if (smoothDistance > maxDistance) {
+    value = 30;  // Sehr weit weg → langsam anfangen
+  } else {
+    // Mapping von Distanz zu Geschwindigkeit (invertiert)
+    value = map(smoothDistance, maxDistance, minDistance, 255, 30);
+  }
+
+  Serial.print("Distanz: ");
+  Serial.print(distance);
+  Serial.print(" mm (geglättet: ");
+  Serial.print(smoothDistance);
+  Serial.print(") -> Wert: ");
+  Serial.println(value);
+
+  setPoti(pot0, value);
+
+  delay(100);
+}
+
+void setPoti(byte addr, byte value) {
+  value = constrain(value, 0, 255);
+
+  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(csPin, LOW);
+  SPI.transfer(addr);
+  SPI.transfer(value);
+  digitalWrite(csPin, HIGH);
+  SPI.endTransaction();
+
+  delay(1);
+}

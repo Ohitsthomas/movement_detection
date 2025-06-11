@@ -8,7 +8,7 @@ const byte csPin     = 2;
 const byte pot0      = 0x12;
 
 // Reaktionsbereich
-const int minDistance = 300;   // <300 mm → Sicherheitsstopp
+const int minDistance = 700;   // <700 mm → Sicherheitsstopp
 const int maxDistance = 1700;  // ≥1700 mm → 255
 
 void setup() {
@@ -21,7 +21,7 @@ void setup() {
   }
 
   sensor.setDistanceMode(VL53L1X::Long);
-  sensor.setMeasurementTimingBudget(50000); // 50 ms Messzyklus
+  sensor.setMeasurementTimingBudget(30000); // 30 ms Messzyklus
   sensor.startContinuous(50);
 
   pinMode(csPin, OUTPUT);
@@ -59,7 +59,7 @@ void loop() {
     // Zwischen 300 mm und 1700 mm
     // map(x, fromHigh, fromLow, toHigh, toLow):
     //    bei 1700 → 255, bei 300 → 30
-    value = map((int)smoothDistance, maxDistance, minDistance, 255, 30);
+    value = map((int)smoothDistance, maxDistance, minDistance, 255, 40);
   }
 
   // 4) Ausgabe & Debug

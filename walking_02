@@ -1,0 +1,90 @@
+#include <Wire.h>
+#include <VL53L1X.h>
+#include <SPI.h>
+
+VL53L1X sensor;
+
+const byte csPin     = 2;
+const byte pot0      = 0x12;
+
+// Reaktionsbereich
+const int minDistance = 300;   // <300 mm → Sicherheitsstopp
+const int maxDistance = 1700;  // ≥1700 mm → 255
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+
+  if (!sensor.init()) {
+    Serial.println("Sensor nicht gefunden!");
+    while (1);
+  }
+
+  sensor.setDistanceMode(VL53L1X::Long);
+  sensor.setMeasurementTimingBudget(50000); // 50 ms Messzyklus
+  sensor.startContinuous(50);
+
+  pinMode(csPin, OUTPUT);
+  digitalWrite(csPin, HIGH);
+  SPI.begin();
+
+  Serial.println("Optimierte Laufbandsteuerung gestartet");
+}
+
+void loop() {
+  int distance = sensor.read();  // in mm
+
+  // 1) Filter: Unplausible Werte ignorieren
+  if (distance < 50 || distance > 4000) {
+    Serial.println("Unplausibler Wert, übersprungen");
+    delay(50);
+    return;
+  }
+
+  // 2) Glättung (neue Werte stärker gewichtet für schnellere Reaktion)
+  static float smoothDistance = maxDistance; // initial auf max
+  smoothDistance = 0.5f * smoothDistance + 0.5f * distance;
+
+  // 3) Distanz → Poti-Wert
+  int value;
+  if (smoothDistance < minDistance) {
+    // Zu nah: Stop
+    value = 0;
+  }
+  else if (smoothDistance >= maxDistance) {
+    // Ab 1700 mm: immer 255
+    value = 255;
+  }
+  else {
+    // Zwischen 300 mm und 1700 mm
+    // map(x, fromHigh, fromLow, toHigh, toLow):
+    //    bei 1700 → 255, bei 300 → 30
+    value = map((int)smoothDistance, maxDistance, minDistance, 255, 30);
+  }
+
+  // 4) Ausgabe & Debug
+  Serial.print("Distanz: ");
+  Serial.print(distance);
+  Serial.print(" mm  (geglättet: ");
+  Serial.print((int)smoothDistance);
+  Serial.print(") -> Poti-Wert: ");
+  Serial.println(value);
+
+  // 5) ans digitale Poti schicken
+  setPoti(pot0, value);
+
+  delay(50); // schnellere Reaktionsschleife
+}
+
+void setPoti(byte addr, byte value) {
+  value = constrain(value, 0, 255);
+
+  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    digitalWrite(csPin, LOW);
+    SPI.transfer(addr);
+    SPI.transfer(value);
+    digitalWrite(csPin, HIGH);
+  SPI.endTransaction();
+
+  delay(1);
+}

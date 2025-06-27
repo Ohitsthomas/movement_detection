@@ -1,0 +1,85 @@
+#include <Wire.h>
+#include <VL53L1X.h>
+#include <SPI.h>
+
+VL53L1X sensor;
+
+const byte csPin = 2;
+const byte pot0  = 0x11;  // MCP41xxx oder ähnliches
+
+// Reaktionsbereich für Sensor auf dem Laufband
+const int minDistance = 500;   // Person ganz vorne (→ volle Geschwindigkeit)
+const int maxDistance = 1700;  // Anfang des Laufbands (→ langsame Geschwindigkeit)
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+
+  if (!sensor.init()) {
+    Serial.println("Sensor nicht gefunden!");
+    while (1);
+  }
+
+  sensor.setDistanceMode(VL53L1X::Long);
+  sensor.setMeasurementTimingBudget(30000); // 30 ms Messzyklus
+  sensor.startContinuous(50);
+
+  pinMode(csPin, OUTPUT);
+  digitalWrite(csPin, HIGH);
+  SPI.begin();
+
+  Serial.println("Laufbandsteuerung gestartet (1 Sensor aktiv)");
+}
+
+void loop() {
+  int distance = sensor.read();  // mm
+
+  if (distance < 50 || distance > 4000) {
+    Serial.println("Unplausibler Wert, übersprungen");
+    delay(50);
+    return;
+  }
+
+  // Glättung
+  static float smoothDistance = maxDistance;
+  smoothDistance = 0.5f * smoothDistance + 0.5f * distance;
+
+  // Distanz → Geschwindigkeit
+  int value;
+  if (smoothDistance < minDistance) {
+    value = 255;  // maximale Geschwindigkeit
+  }
+  else if (smoothDistance >= maxDistance) {
+    value = 128;  // Stillstand
+  }
+  else {
+    // Je näher, desto schneller
+    value = map((int)smoothDistance, maxDistance, minDistance, 128, 255);
+  }
+
+  value = constrain(value, 0, 255);
+
+  // Debug
+  Serial.print("Distanz: ");
+  Serial.print(distance);
+  Serial.print(" mm  (geglättet: ");
+  Serial.print((int)smoothDistance);
+  Serial.print(") → Poti-Wert: ");
+  Serial.println(value);
+
+  // Senden an digitales Poti (oder Motorsteuerung)
+  setPoti(pot0, value);
+
+  delay(50);
+}
+
+void setPoti(byte addr, byte value) {
+  value = constrain(value, 0, 255);
+
+  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(csPin, LOW);
+  SPI.transfer(addr);
+  SPI.transfer(value);
+  digitalWrite(csPin, HIGH);
+  SPI.endTransaction();
+}

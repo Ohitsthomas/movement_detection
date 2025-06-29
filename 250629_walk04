@@ -1,0 +1,80 @@
+#include <Wire.h>
+#include <VL53L1X.h>
+#include <SPI.h>
+
+VL53L1X sensor;
+
+const byte csPin = 2;
+const byte pot0  = 0x12; // MCP42010: Kanal 1
+
+// Reaktionsbereich erweitert:
+const int minDistance = 200;    // 20 cm → max Speed
+const int maxDistance = 2100;   // 210 cm → ganz leichtes Anlaufen
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+
+  if (!sensor.init()) {
+    Serial.println("Sensor nicht gefunden!");
+    while (1);
+  }
+
+  sensor.setDistanceMode(VL53L1X::Long);
+  sensor.setMeasurementTimingBudget(30000);
+  sensor.startContinuous(50);
+
+  pinMode(csPin, OUTPUT);
+  digitalWrite(csPin, HIGH);
+  SPI.begin();
+
+  Serial.println("🚀 Laufbandsteuerung (mit früher Reaktion) bereit!");
+}
+
+void loop() {
+  int distance = sensor.read();
+
+  if (distance < 50 || distance > 4000) {
+    Serial.println("⚠️ Ungültiger Wert – übersprungen");
+    delay(50);
+    return;
+  }
+
+  static float smoothDistance = maxDistance;
+  smoothDistance = 0.5 * smoothDistance + 0.5 * distance;
+
+  int value;
+
+  if (smoothDistance <= minDistance) {
+    value = 255;
+  } else if (smoothDistance >= maxDistance) {
+    value = 0;
+  } else {
+    // Mapping (umgekehrt: Nah = schnell)
+    value = map((int)smoothDistance, minDistance, maxDistance, 255, 0);
+  }
+
+  // Invertierung wegen Motor-Logik
+  value = 255 - value;
+
+  Serial.print("Distanz: ");
+  Serial.print(distance);
+  Serial.print(" mm (glatt: ");
+  Serial.print((int)smoothDistance);
+  Serial.print(") => Poti: ");
+  Serial.println(value);
+
+  setPoti(pot0, value);
+  delay(50);
+}
+
+void setPoti(byte addr, byte value) {
+  value = constrain(value, 0, 255);
+
+  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(csPin, LOW);
+  SPI.transfer(addr);
+  SPI.transfer(value);
+  digitalWrite(csPin, HIGH);
+  SPI.endTransaction();
+}

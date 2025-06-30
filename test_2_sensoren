@@ -19,27 +19,25 @@ const int frontMinDist = 200;
 const int frontMaxDist = 2300;
 
 // Rampen-Sensor (On/Off zwischen 200 mm und 1700 mm)
-// Alle Messwerte ab 2000 mm werden nicht berücksichtigt
 const int rampMinDist       = 200;
 const int rampMaxDist       = 1700;
-const int rampOverrideValue = 100;
-const int rampMaxMeasure    = 2000; // obere Grenze für gültige Rohdaten
+const int rampOverrideValue = 80;
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial);
+  while(!Serial);
 
   Wire.begin();
   Wire.setClock(400000);
 
   // Sensoren resetten
-  for (uint8_t i = 0; i < sensorCount; i++) {
+  for (uint8_t i=0; i<sensorCount; i++){
     pinMode(xshutPins[i], OUTPUT);
     digitalWrite(xshutPins[i], LOW);
   }
 
   // Sensoren nacheinander hochfahren und konfigurieren
-  for (uint8_t i = 0; i < sensorCount; i++) {
+  for (uint8_t i=0; i<sensorCount; i++){
     pinMode(xshutPins[i], INPUT);
     delay(10);
     sensors[i].setTimeout(500);
@@ -64,51 +62,40 @@ void setup() {
 
 void loop() {
   // 1) Einlesen
-  int rawDistRamp  = sensors[0].read();
-  int distFront    = sensors[1].read();
+  int distRamp  = sensors[0].read();
+  int distFront = sensors[1].read();
 
   // 2) smoothing für Front-Sensor
-  static float smoothFront = frontMaxDist;
-  if (distFront > 50 && distFront < 4000) {
-    smoothFront = 0.5f * smoothFront + 0.5f * distFront;
-  }
+  static float smooth = frontMaxDist;
 
-  // 3) smoothing und Validierung für Rampen-Sensor
-  static float smoothRamp = rampMaxDist;
-  // Nur Werte zwischen 50 mm und 2000 mm gelten als valide
-  bool validRamp = (rawDistRamp > 50 && rawDistRamp < rampMaxMeasure && !sensors[0].timeoutOccurred());
-  if (validRamp) {
-    // nur langsam anpassen, um Peaks zu filtern
-    smoothRamp = 0.7f * smoothRamp + 0.3f * rawDistRamp;
-  }
-  // else: smoothRamp behält alten Wert bei
+  // 3) Rampen-Zone prüfen
+  bool rampActive = (distRamp > rampMinDist && distRamp < rampMaxDist);
 
-  // 4) Rampen-Zone prüfen auf geglätteten Wert
-  bool rampActive = (smoothRamp > rampMinDist && smoothRamp < rampMaxDist);
-
-  // 5) Poti-Wert ermitteln
   int value;
   if (rampActive) {
-    // Rampenbereich konstant: Override-Wert
+    // Hier wird die Geschwindigkeit des Rampen-Sensors festgelegt:
+    // Konstant auf den Override-Wert eingestellt, wenn innerhalb der definierten Zone.
     value = rampOverrideValue;
-  } else {
-    // Front-Logik mit geglättetem Wert
-    if (smoothFront <= frontMinDist)      value = 255;
-    else if (smoothFront >= frontMaxDist) value = 0;
-    else                                   value = map((int)smoothFront, frontMinDist, frontMaxDist, 255, 0);
+  }
+  else {
+    // Front-Logik
+    if (distFront > 50 && distFront < 4000)
+      smooth = 0.5f * smooth + 0.5f * distFront;
+
+    if (smooth <= frontMinDist)      value = 255;
+    else if (smooth >= frontMaxDist) value = 0;
+    else                              value = map((int)smooth, frontMinDist, frontMaxDist, 255, 0);
+
     value = 255 - value;
   }
 
-  // 6) Debug-Ausgabe
-  Serial.print("RawRamp:"); Serial.print(rawDistRamp);
-  if (!validRamp) Serial.print(" (invalid)");
-  Serial.print("  SmoothRamp:"); Serial.print((int)smoothRamp);
+  // 4) Debug + Poti
+  Serial.print("Ramp:"); Serial.print(distRamp);
   Serial.print(rampActive ? " ON" : " off");
-  Serial.print("  RawFront:"); Serial.print(distFront);
-  Serial.print("  SmoothFront:"); Serial.print((int)smoothFront);
+  Serial.print("  Front:"); Serial.print(distFront);
+  Serial.print("  smooth:"); Serial.print((int)smooth);
   Serial.print("  → Poti:"); Serial.println(value);
 
-  // 7) Poti setzen
   setPoti(pot1, value);
   delay(50);
 }

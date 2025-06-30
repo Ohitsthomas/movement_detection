@@ -1,0 +1,125 @@
+#include <Wire.h>
+#include <VL53L1X.h>
+#include <SPI.h>
+
+// --- Globale Deklarationen ganz oben ---
+// Anzahl der Sensoren und XSHUT-Pins
+const uint8_t sensorCount = 2;
+const uint8_t xshutPins[sensorCount] = { 4, 3 };
+
+// Die Sensor-Objekte
+VL53L1X sensors[sensorCount];
+
+// Poti über MCP42010 / SPI
+const byte csPin = 2;
+const byte pot1  = 0x12;
+
+// Front-Sensor (variable Geschwindigkeit)
+const int frontMinDist = 200;
+const int frontMaxDist = 2300;
+
+// Rampen-Sensor (On/Off zwischen 200 mm und 1700 mm)
+// Alle Messwerte ab 2000 mm werden nicht berücksichtigt
+const int rampMinDist       = 200;
+const int rampMaxDist       = 1700;
+const int rampOverrideValue = 100;
+const int rampMaxMeasure    = 2000; // obere Grenze für gültige Rohdaten
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  Wire.begin();
+  Wire.setClock(400000);
+
+  // Sensoren resetten
+  for (uint8_t i = 0; i < sensorCount; i++) {
+    pinMode(xshutPins[i], OUTPUT);
+    digitalWrite(xshutPins[i], LOW);
+  }
+
+  // Sensoren nacheinander hochfahren und konfigurieren
+  for (uint8_t i = 0; i < sensorCount; i++) {
+    pinMode(xshutPins[i], INPUT);
+    delay(10);
+    sensors[i].setTimeout(500);
+    if (sensors[i].init()) {
+      sensors[i].setAddress(0x2A + i);
+      sensors[i].setDistanceMode(VL53L1X::Long);
+      sensors[i].setMeasurementTimingBudget(30000);
+      sensors[i].startContinuous(50);
+      Serial.print("Sensor "); Serial.print(i); Serial.println(" OK");
+    } else {
+      Serial.print("⚠️ Sensor "); Serial.print(i); Serial.println(" FEHLER");
+    }
+    delay(10);
+  }
+
+  pinMode(csPin, OUTPUT);
+  digitalWrite(csPin, HIGH);
+  SPI.begin();
+
+  Serial.println("Setup fertig!");
+}
+
+void loop() {
+  // 1) Einlesen
+  int rawDistRamp  = sensors[0].read();
+  int distFront    = sensors[1].read();
+
+  // 2) smoothing für Front-Sensor
+  static float smoothFront = frontMaxDist;
+  if (distFront > 50 && distFront < 4000) {
+    smoothFront = 0.5f * smoothFront + 0.5f * distFront;
+  }
+
+  // 3) smoothing und Validierung für Rampen-Sensor
+  static float smoothRamp = rampMaxDist;
+  // Nur Werte zwischen 50 mm und 2000 mm gelten als valide
+  bool validRamp = (rawDistRamp > 50 && rawDistRamp < rampMaxMeasure && !sensors[0].timeoutOccurred());
+  if (validRamp) {
+    // nur langsam anpassen, um Peaks zu filtern
+    smoothRamp = 0.7f * smoothRamp + 0.3f * rawDistRamp;
+  }
+  // else: smoothRamp behält alten Wert bei (bleibt außerhalb der aktiven Zone)
+
+  // 4) Rampen-Zone prüfen auf geglätteten Wert (nur wenn valide Messung)
+  bool rampActive = validRamp && (smoothRamp > rampMinDist && smoothRamp < rampMaxDist);
+
+  // 5) Poti-Wert ermitteln
+  int value;
+  if (rampActive) {
+    // Rampenbereich konstant: Override-Wert
+    value = rampOverrideValue;
+  } else {
+    // Front-Logik mit geglättetem Wert
+    if (smoothFront <= frontMinDist)      value = 255;
+    else if (smoothFront >= frontMaxDist) value = 0;
+    else                                   value = map((int)smoothFront, frontMinDist, frontMaxDist, 255, 0);
+    value = 255 - value;
+  }
+
+  // 6) Debug-Ausgabe
+  Serial.print("RawRamp:"); Serial.print(rawDistRamp);
+  if (!validRamp) Serial.print(" (invalid)");
+  Serial.print("  SmoothRamp:"); Serial.print((int)smoothRamp);
+  Serial.print(rampActive ? " ON" : " off");
+  Serial.print("  RawFront:"); Serial.print(distFront);
+  Serial.print("  SmoothFront:"); Serial.print((int)smoothFront);
+  Serial.print("  → Poti:"); Serial.println(value);
+
+  // 7) Poti setzen
+  setPoti(pot1, value);
+  delay(50);
+}
+
+// MCP42010-Helfer
+void setPoti(byte addr, byte value) {
+  value = constrain(value, 0, 255);
+  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    digitalWrite(csPin, LOW);
+    SPI.transfer(addr);
+    SPI.transfer(value);
+    digitalWrite(csPin, HIGH);
+  SPI.endTransaction();
+}

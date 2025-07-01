@@ -1,0 +1,107 @@
+#include <Wire.h>
+#include <VL53L1X.h>
+#include <SPI.h>
+
+// --- Globale Deklarationen ---
+// Anzahl der Sensoren und XSHUT-Pins
+const uint8_t sensorCount = 2;
+const uint8_t xshutPins[sensorCount] = { 4, 3 };  // [0]=Rampe→D4, [1]=Front→D3
+
+// VL53L1X-Objekte
+VL53L1X sensors[sensorCount];
+
+// MCP42010 (digitales Poti) über SPI
+const byte csPin = 2;
+const byte pot1  = 0x12;      // Kanal 1
+
+// Front-Sensor (variable Geschwindigkeit)
+const int frontMinDist = 700;   //  70 cm → Max-Speed (255)
+const int frontMaxDist = 2300;  // 230 cm → Stopp (0)
+
+// Rampen-Sensor (On/Off zwischen 20 cm und 200 cm)
+const int rampMinDist       = 200;  // 20 cm
+const int rampMaxDist       = 2000; // 200 cm
+const int rampOverrideValue = 150;  // fester Speed-Wert bei Rampeneintritt
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  // I²C initialisieren
+  Wire.begin();
+  Wire.setClock(400000);
+
+  // Beide Sensoren resetten (XSHUT LOW)
+  for (uint8_t i = 0; i < sensorCount; i++) {
+    pinMode(xshutPins[i], OUTPUT);
+    digitalWrite(xshutPins[i], LOW);
+  }
+
+  // Sensoren einzeln hochfahren und konfigurieren
+  for (uint8_t i = 0; i < sensorCount; i++) {
+    pinMode(xshutPins[i], INPUT);
+    delay(10);
+    sensors[i].setTimeout(500);
+    if (sensors[i].init()) {
+      sensors[i].setAddress(0x2A + i);
+      sensors[i].setDistanceMode(VL53L1X::Long);
+      sensors[i].setMeasurementTimingBudget(30000);
+      sensors[i].startContinuous(50);
+      Serial.print("Sensor "); Serial.print(i); Serial.println(" OK");
+    } else {
+      Serial.print("⚠️ Sensor "); Serial.print(i); Serial.println(" FEHLER");
+    }
+    delay(10);
+  }
+
+  // SPI / Poti-CS initialisieren
+  pinMode(csPin, OUTPUT);
+  digitalWrite(csPin, HIGH);
+  SPI.begin();
+
+  Serial.println("Setup fertig!");
+}
+
+void loop() {
+  // 1) Messwerte einlesen
+  int distRamp  = sensors[0].read();
+  int distFront = sensors[1].read();
+
+  // 2) Glättung für Front
+  static float smooth = frontMaxDist;
+  if (distFront > 50 && distFront < 4000) {
+    smooth = 0.5f * smooth + 0.5f * distFront;
+  }
+
+  // 3) Rampen-Schalter
+  bool rampActive = (distRamp > rampMinDist && distRamp < rampMaxDist);
+
+  // 4) Wert berechnen
+  int value;
+  if (rampActive) {
+    // im Rampenbereich feste Geschwindigkeit
+    value = rampOverrideValue;
+  } else {
+    // variable Front-Geschwindigkeit: near→255, far→0
+    if      (smooth <= frontMinDist)  value = 255;
+    else if (smooth >= frontMaxDist)  value = 0;
+    else                               value = map((int)smooth, frontMinDist, frontMaxDist, 255, 0);
+  }
+
+  // 5) Debug-Ausgabe
+  Serial.print("Ramp:");  Serial.print(distRamp);
+  Serial.print(rampActive ? " ON" : " off");
+  Serial.print("  Front:"); Serial.print(distFront);
+  Serial.print("  smooth:"); Serial.print((int)smooth);
+  Serial.print("  → Poti:"); Serial.println(value);
+
+  // 6) Poti setzen
+  SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    digitalWrite(csPin, LOW);
+    SPI.transfer(pot1);
+    SPI.transfer(value);
+    digitalWrite(csPin, HIGH);
+  SPI.endTransaction();
+
+  delay(50);
+}

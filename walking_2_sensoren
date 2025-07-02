@@ -2,41 +2,50 @@
 #include <VL53L1X.h>
 #include <SPI.h>
 
-// --- Globale Deklarationen ganz oben ---
-// Anzahl der Sensoren und XSHUT-Pins
+// --- Globale Deklarationen ---
 const uint8_t sensorCount = 2;
-const uint8_t xshutPins[sensorCount] = { 4, 3 };
+const uint8_t xshutPins[sensorCount] = { 4, 3 };  // [0]=Rampe→D4, [1]=Front→D3
 
-// Die Sensor-Objekte
 VL53L1X sensors[sensorCount];
 
-// Poti über MCP42010 / SPI
+// MCP42010 (digitales Poti) über SPI
 const byte csPin = 2;
-const byte pot1  = 0x12;
+const byte pot1  = 0x12;      // Kanal 1
 
 // Front-Sensor (variable Geschwindigkeit)
-const int frontMinDist = 200;
-const int frontMaxDist = 2300;
+const int frontMinDist = 700;   //  70 cm → Max-Speed (255)
+const int frontMaxDist = 2000;  // 230 cm → Stopp (0)
 
-// Rampen-Sensor (On/Off)
-const int rampThreshold = 1700;
-const int rampMiniSpeed =  80;
+// Rampen-Sensor (On/Off zwischen 20 cm und 200 cm)
+const int rampMinDist       = 200;  // 20 cm
+const int rampMaxDist       = 2000; // 200 cm
+const int rampOverrideValue = 100;  // fester Speed-Wert bei Rampeneintritt
+
+// Glättungsfaktoren
+const float rampSmoothOld = 0.9f;
+const float rampSmoothNew = 0.1f;
+const float frontSmoothOld = 0.7f;
+const float frontSmoothNew = 0.3f;
+
+// --- Ramp Still Detection ---
+const int rampStillThreshold = 20;    // Schwelle in mm (Toleranz für "keine Veränderung")
+const int rampStillLimit = 10;       // Anzahl Loops ohne Änderung, bevor Poti=0 (10*50ms=0.5s)
 
 void setup() {
   Serial.begin(115200);
-  while(!Serial);
+  while (!Serial);
 
   Wire.begin();
   Wire.setClock(400000);
 
-  // Sensoren resetten
-  for (uint8_t i=0; i<sensorCount; i++){
+  // Beide Sensoren resetten (XSHUT LOW)
+  for (uint8_t i = 0; i < sensorCount; i++) {
     pinMode(xshutPins[i], OUTPUT);
     digitalWrite(xshutPins[i], LOW);
   }
 
-  // Sensoren nacheinander hochfahren und konfigurieren
-  for (uint8_t i=0; i<sensorCount; i++){
+  // Sensoren einzeln hochfahren und konfigurieren
+  for (uint8_t i = 0; i < sensorCount; i++) {
     pinMode(xshutPins[i], INPUT);
     delay(10);
     sensors[i].setTimeout(500);
@@ -52,6 +61,7 @@ void setup() {
     delay(10);
   }
 
+  // SPI / Poti-CS initialisieren
   pinMode(csPin, OUTPUT);
   digitalWrite(csPin, HIGH);
   SPI.begin();
@@ -60,51 +70,120 @@ void setup() {
 }
 
 void loop() {
-  // 1) Einlesen
+  // --- Statische Variablen am Anfang ---
+  static float smoothRamp  = rampMaxDist;
+  static float smoothFront = frontMaxDist;
+
+  // Buffer für Medianfilter
+  const int rampBufLen = 3;
+  static int rampBuf[rampBufLen];
+  static int rampIdx = 0;
+  static bool rampInit = false;
+  const int frontBufLen = 3;
+  static int frontBuf[frontBufLen];
+  static int frontIdx = 0;
+  static bool frontInit = false;
+
+  // --- Stillness Detection ---
+  static int rampStillCounter = 0;
+  static int lastSmoothRamp = rampMaxDist;
+
+  // 1) Messwerte einlesen
   int distRamp  = sensors[0].read();
   int distFront = sensors[1].read();
 
-  // 2) smooth oben einmal definieren
-  static float smooth = frontMaxDist;
+  // Ramp-Initialisierung
+  if (!rampInit && distRamp > 50 && distRamp < 4000) {
+    for (int i = 0; i < rampBufLen; i++) rampBuf[i] = distRamp;
+    smoothRamp = distRamp;
+    rampInit = true;
+  }
+  // Front-Initialisierung
+  if (!frontInit && distFront > 50 && distFront < 4000) {
+    for (int i = 0; i < frontBufLen; i++) frontBuf[i] = distFront;
+    smoothFront = distFront;
+    frontInit = true;
+  }
 
-  // 3) Rampen-Schalter
-  bool rampActive = (distRamp > 50 && distRamp < rampThreshold);
+  // --- Medianfilter & Glättung ---
+  int rampMedian = (rampInit) ? smoothRamp : distRamp;
+  if (rampInit && distRamp > 50 && distRamp < 4000) {
+    rampBuf[rampIdx] = distRamp;
+    rampIdx = (rampIdx + 1) % rampBufLen;
+    int sorted[rampBufLen];
+    memcpy(sorted, rampBuf, sizeof(sorted));
+    for (int i = 0; i < rampBufLen - 1; i++)
+      for (int j = i + 1; j < rampBufLen; j++)
+        if (sorted[j] < sorted[i]) {
+          int t = sorted[i]; sorted[i] = sorted[j]; sorted[j] = t;
+        }
+    rampMedian = sorted[rampBufLen / 2];
+    if (abs(rampMedian - smoothRamp) < 600)
+      smoothRamp = rampSmoothOld * smoothRamp + rampSmoothNew * rampMedian;
+    else
+      smoothRamp = rampMedian;
+  }
 
+  int frontMedian = (frontInit) ? smoothFront : distFront;
+  if (frontInit && distFront > 50 && distFront < 4000) {
+    frontBuf[frontIdx] = distFront;
+    frontIdx = (frontIdx + 1) % frontBufLen;
+    int sorted[frontBufLen];
+    memcpy(sorted, frontBuf, sizeof(sorted));
+    for (int i = 0; i < frontBufLen - 1; i++)
+      for (int j = i + 1; j < frontBufLen; j++)
+        if (sorted[j] < sorted[i]) {
+          int t = sorted[i]; sorted[i] = sorted[j]; sorted[j] = t;
+        }
+    frontMedian = sorted[frontBufLen / 2];
+    if (abs(frontMedian - smoothFront) < 600)
+      smoothFront = frontSmoothOld * smoothFront + frontSmoothNew * frontMedian;
+    else
+      smoothFront = frontMedian;
+  }
+
+  // --- Rampen-Schalter ---
+  bool rampActive = (smoothRamp > rampMinDist && smoothRamp < rampMaxDist);
+
+  // --- Stillness Detection ---
+  if (abs((int)smoothRamp - lastSmoothRamp) <= rampStillThreshold) {
+    rampStillCounter++;
+  } else {
+    rampStillCounter = 0;
+  }
+  lastSmoothRamp = (int)smoothRamp;
+  bool rampSensorIsStill = (rampStillCounter >= rampStillLimit);
+
+  // --- Wert berechnen ---
   int value;
-  if (rampActive) {
-    // immer Minigeschwindigkeit
-    value = rampMiniSpeed;
-  }
-  else {
-    // Front-Logik
-    if (distFront > 50 && distFront < 4000)
-      smooth = 0.5f * smooth + 0.5f * distFront;
-
-    if (smooth <= frontMinDist)      value = 255;
-    else if (smooth >= frontMaxDist) value = 0;
-    else                              value = map((int)smooth, frontMinDist, frontMaxDist, 255, 0);
-
-    value = 255 - value;
+  if (rampSensorIsStill) {
+    value = 0;
+  } else if (rampActive) {
+    value = rampOverrideValue;
+  } else {
+    if      (smoothFront <= frontMinDist)  value = 255;
+    else if (smoothFront >= frontMaxDist)  value = 0;
+    else value = map((int)smoothFront, frontMinDist, frontMaxDist, 255, 0);
   }
 
-  // 4) Debug + Poti
-  Serial.print("Ramp:"); Serial.print(distRamp);
+  // --- Debug-Ausgabe ---
+  Serial.print("Ramp:");  Serial.print(distRamp);
+  Serial.print(" [med:"); Serial.print(rampMedian);
+  Serial.print(" glatt:"); Serial.print((int)smoothRamp); Serial.print("]");
   Serial.print(rampActive ? " ON" : " off");
   Serial.print("  Front:"); Serial.print(distFront);
-  Serial.print("  smooth:"); Serial.print((int)smooth);
+  Serial.print(" [med:"); Serial.print(frontMedian);
+  Serial.print(" glatt:"); Serial.print((int)smoothFront); Serial.print("]");
+  if (rampSensorIsStill) Serial.print(" [STILL]");
   Serial.print("  → Poti:"); Serial.println(value);
 
-  setPoti(pot1, value);
-  delay(50);
-}
-
-// MCP42010-Helfer
-void setPoti(byte addr, byte value) {
-  value = constrain(value, 0, 255);
+  // --- Poti setzen ---
   SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
     digitalWrite(csPin, LOW);
-    SPI.transfer(addr);
+    SPI.transfer(pot1);
     SPI.transfer(value);
     digitalWrite(csPin, HIGH);
   SPI.endTransaction();
+
+  delay(50);
 }

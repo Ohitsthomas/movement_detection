@@ -2,6 +2,19 @@
 #include <VL53L1X.h>
 #include <SPI.h>
 
+#include <WiFiS3.h>
+#include <WiFiUdp.h>
+#include <OSCMessage.h>
+// WiFi Setup
+const char* ssid = "EasyBox-640692";
+const char* password = "ZiDTuMtLdMMXB5HX";
+// OSC destination
+IPAddress outIp(192, 168, 2, 101);
+unsigned int outPort1 = 8000;
+WiFiUDP Udp;
+unsigned long lastSend = 0; 
+const unsigned long sendInterval = 1000; 
+
 // --- Globale Deklarationen ---
 const uint8_t sensorCount = 2;
 const uint8_t xshutPins[sensorCount] = { 4, 3 };  // [0]=Rampe→D4, [1]=Front→D3
@@ -34,6 +47,12 @@ const int rampStillLimit = 10;       // Anzahl Loops ohne Änderung, bevor Poti=
 void setup() {
   Serial.begin(115200);
   while (!Serial);
+
+// Connect to WiFi
+ while (WiFi.begin(ssid, password) != WL_CONNECTED) {
+ delay(1000);
+ }
+ Udp.begin(outPort1); 
 
   Wire.begin();
   Wire.setClock(400000);
@@ -70,6 +89,7 @@ void setup() {
 }
 
 void loop() {
+  unsigned long now = millis(); 
   // --- Statische Variablen am Anfang ---
   static float smoothRamp  = rampMaxDist;
   static float smoothFront = frontMaxDist;
@@ -184,6 +204,18 @@ void loop() {
     SPI.transfer(value);
     digitalWrite(csPin, HIGH);
   SPI.endTransaction();
+
+   if (now - lastSend >= sendInterval) {
+ lastSend = now;
+ // Send OSC message with valueToSend (0 or 1)
+ OSCMessage msg("/toggle");
+ msg.add(value);
+ Udp.beginPacket(outIp, outPort1);
+ msg.send(Udp);
+ Udp.endPacket();
+ msg.empty();
+ // Toggle value for next send
+ }
 
   delay(50);
 }

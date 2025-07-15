@@ -1,0 +1,199 @@
+#include <Wire.h>
+#include <VL53L1X.h>
+#include <SPI.h>
+
+#include <WiFiS3.h>
+#include <WiFiUdp.h>
+#include <OSCMessage.h>
+
+// WiFi Setup
+const char* ssid = "EasyBox-640692";
+const char* password = "ZiDTuMtLdMMXB5HX";
+// OSC destination
+IPAddress outIp(192, 168, 2, 109);
+unsigned int outPort1 = 8030;
+WiFiUDP Udp;
+unsigned long lastSend = 0;
+const unsigned long sendInterval = 5000;
+int valueToSend = 0;
+
+// --- Globale Deklarationen ---
+const uint8_t sensorCount = 2;
+const uint8_t xshutPins[sensorCount] = { 4, 3 };  // [0]=Rampe→D4, [1]=Front→D3
+VL53L1X sensors[sensorCount];
+
+const byte csPin = 2;
+const byte pot1 = 0x12;
+
+// --- Glättung ---
+const uint8_t SMOOTHING_WINDOW = 30;
+int distHistory[sensorCount][SMOOTHING_WINDOW] = { 5 };
+uint8_t historyIndex = 0;
+
+// --- Logik ---
+int previousValue = 0;
+const int STABILIZATION_THRESHOLD = 10;  // Nur bei Änderung >10 wird neu gesetzt
+
+// --- Setup ---
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  // --- WiFi mit maximaler Versuchszahl ---
+  int wifiTries = 0;
+  Serial.print("🔌 Verbinde mit WLAN: ");
+  Serial.println(ssid);
+  while (WiFi.begin(ssid, password) != WL_CONNECTED && wifiTries < 10) {
+    delay(1000);
+    Serial.print(".");
+    wifiTries++;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\n❌ WLAN konnte nicht verbunden werden.");
+    while (1); // Stoppe hier
+  }
+  Serial.println("\n✅ WLAN verbunden!");
+
+  Udp.begin(outPort1); 
+  delay(1000);
+
+  Wire.begin();
+  Wire.setClock(400000);
+
+  // --- Sensor XSHUT-Pins LOW ---
+  for (uint8_t i = 0; i < sensorCount; i++) {
+    pinMode(xshutPins[i], OUTPUT);
+    digitalWrite(xshutPins[i], LOW);
+  }
+  delay(100);
+
+  // --- Sensoren nacheinander initialisieren mit robuster Prüfung ---
+  for (uint8_t i = 0; i < sensorCount; i++) {
+    bool success = false;
+    pinMode(xshutPins[i], INPUT);
+    delay(10);
+    sensors[i].setTimeout(500);
+
+    for (uint8_t attempt = 0; attempt < 3; attempt++) {
+      if (sensors[i].init()) {
+        sensors[i].setAddress(0x2A + i);
+        sensors[i].setDistanceMode(VL53L1X::Long);
+        sensors[i].setMeasurementTimingBudget(33000);
+        sensors[i].startContinuous(50);
+        Serial.print("✅ Sensor "); Serial.print(i); Serial.println(" bereit");
+        success = true;
+        break;
+      }
+      delay(100);
+      Serial.print("❗️Init-Versuch "); Serial.print(attempt+1); Serial.print(" für Sensor "); Serial.println(i);
+    }
+    if (!success) {
+      Serial.print("❌ Sensor "); Serial.print(i); Serial.println(" konnte nicht initialisiert werden. Stoppe.");
+      while (1); // Stoppt das Programm, wenn ein Sensor nicht bereit ist
+    }
+  }
+
+  pinMode(csPin, OUTPUT);
+  digitalWrite(csPin, HIGH);
+  SPI.begin();
+
+  Serial.println("🔧 Setup abgeschlossen");
+}
+
+// --- Gleitender Mittelwert ---
+int getSmoothedDistance(uint8_t sensorIndex, int newValue, int lastValid) {
+  if (newValue < 50 || newValue > 4000) newValue = lastValid;
+
+  distHistory[sensorIndex][historyIndex] = newValue;
+
+  int sum = 0;
+  for (uint8_t i = 0; i < SMOOTHING_WINDOW; i++) {
+    sum += distHistory[sensorIndex][i];
+  }
+
+  return sum / SMOOTHING_WINDOW;
+}
+
+// --- Loop ---
+void loop() {
+  unsigned long now = millis(); 
+  static int lastValidRamp = 500;
+  static int lastValidFront = 500;
+
+  int rawRamp = sensors[0].read();
+  int rawFront = sensors[1].read();
+
+  // --- Timeout-Prüfung ---
+  if (sensors[0].timeoutOccurred()) {
+    Serial.println("⚠️ TIMEOUT Ramp");
+    // Optional: Sensor neu starten oder weiter machen
+  }
+  if (sensors[1].timeoutOccurred()) {
+    Serial.println("⚠️ TIMEOUT Front");
+    // Optional: Sensor neu starten oder weiter machen
+  }
+
+  int distRamp  = getSmoothedDistance(0, rawRamp, lastValidRamp);
+  int distFront = getSmoothedDistance(1, rawFront, lastValidFront);
+
+  lastValidRamp = distRamp;
+  lastValidFront = distFront;
+  historyIndex = (historyIndex + 1) % SMOOTHING_WINDOW;
+
+  // --- Neue Ziel-Value berechnen ---
+  int targetValue = 0;
+
+  // Rampe: fixer Wert 127 bei 920–2000 mm
+  if (distRamp >= 1000 && distRamp <= 2000) {
+    targetValue = 100;
+  }
+
+  // Front: dynamisch von 2100 → 880 (100 → 255)
+  if (distFront < 2200) {
+    int valueFront = map(distFront, 2200, 880, 70, 255);
+    valueFront = constrain(valueFront, 100, 255);
+    targetValue = max(targetValue, valueFront);
+  }
+
+  // --- Hysterese: nur reagieren bei nennenswerter Änderung ---
+  if (abs(targetValue - previousValue) >= STABILIZATION_THRESHOLD || targetValue == 0) {
+    previousValue = targetValue;
+
+    // SPI: Wert setzen
+    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+      digitalWrite(csPin, LOW);
+      SPI.transfer(pot1);
+      SPI.transfer(previousValue);
+      digitalWrite(csPin, HIGH);
+    SPI.endTransaction();
+  }
+
+  // Debug
+  Serial.print("Ramp: "); Serial.print(distRamp);
+  Serial.print(" mm, Front: "); Serial.print(distFront);
+  Serial.print(" mm → value = "); Serial.println(previousValue);
+
+  delay(50);  // Schneller reagieren
+
+  // --- WiFi Verbindung prüfen, ggf. Meldung ---
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("⚠️ WLAN-Verbindung verloren!");
+    // Optional: WiFi.reconnect(); oder Neustart auslösen
+    // while(1); // Stoppen
+  }
+
+  // --- OSC senden ---
+  if (now - lastSend >= sendInterval) {
+    lastSend = now;
+    OSCMessage msg("/toggle");
+    msg.add(previousValue);
+    Udp.beginPacket(outIp, outPort1);
+    msg.send(Udp);
+    Udp.endPacket();
+    msg.empty();
+    valueToSend = 1 - valueToSend;
+  }
+
+  // --- Optional: Watchdog-Reset hier einbauen (je nach Board) ---
+
+}
